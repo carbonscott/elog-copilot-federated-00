@@ -2,7 +2,7 @@
 """
 federated_elog.py - Federated Elog Query Layer
 
-Uses DuckDB to dynamically attach per-experiment SQLite databases,
+Uses DuckDB to dynamically attach per-experiment DuckDB databases,
 leveraging filesystem permissions for access control.
 """
 
@@ -26,7 +26,7 @@ class FederatedElog:
     """
     Federated query layer for elog-copilot databases.
 
-    Uses DuckDB to dynamically attach per-experiment SQLite databases,
+    Uses DuckDB to dynamically attach per-experiment DuckDB databases,
     leveraging filesystem permissions for access control.
     """
 
@@ -41,12 +41,11 @@ class FederatedElog:
         if not self.master_db_path.exists():
             raise FileNotFoundError(f"Master database not found: {master_db_path}")
 
-        # Create DuckDB connection and load SQLite extension
+        # Create DuckDB connection
         self.conn = duckdb.connect(":memory:")
-        self.conn.execute("INSTALL sqlite; LOAD sqlite;")
 
         # Attach master database
-        self.conn.execute(f"ATTACH '{self.master_db_path}' AS master (TYPE sqlite)")
+        self.conn.execute(f"ATTACH '{self.master_db_path}' AS master")
 
         # Track attached experiment databases
         self._attached: List[str] = []
@@ -115,7 +114,7 @@ class FederatedElog:
             return False, f"Permission denied: {db_path}"
 
         try:
-            self.conn.execute(f"ATTACH '{db_path}' AS exp_{exp_id} (TYPE sqlite)")
+            self.conn.execute(f"ATTACH '{db_path}' AS exp_{exp_id}")
             self._attached.append(exp_id)
             return True, "Attached"
         except Exception as e:

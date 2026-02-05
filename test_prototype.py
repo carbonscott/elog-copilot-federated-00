@@ -14,7 +14,7 @@ sys.path.insert(0, 'src')
 
 from federated_elog import FederatedElog
 
-MASTER_DB = "data/master.db"
+MASTER_DB = "data/master.duckdb"
 
 
 def print_section(title: str):
