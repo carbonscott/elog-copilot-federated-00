@@ -1,11 +1,11 @@
 # Federated Elog-Copilot
 
-A prototype for permission-gated, per-experiment elog databases using DuckDB's SQLite extension.
+A prototype for permission-gated, per-experiment elog databases using native DuckDB format.
 
 ## Quick Start
 
 ```bash
-cd /sdf/data/lcls/ds/prj/prjdat21/results/cwang31/elog-copilot-federated
+cd /sdf/data/lcls/ds/prj/prjdat21/results/cwang31/elog-copilot-federated-b
 
 # Run the test suite
 UV_CACHE_DIR=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/.UV_CACHE \
@@ -28,15 +28,15 @@ elog-copilot-federated/
 │   └── federated_elog.py          # Python query layer
 ├── test_prototype.py         # Test suite
 └── data/
-    ├── master.db             # Public index (experiment IDs, paths, detectors)
+    ├── master.duckdb         # Public index (experiment IDs, paths, detectors)
     └── experiments/
         ├── cxi/
-        │   ├── cxi25410/.elog/elog.db    # Readable
-        │   └── cxilx8720/.elog/elog.db   # Readable
+        │   ├── cxi25410/.elog/elog.duckdb    # Readable
+        │   └── cxilx8720/.elog/elog.duckdb   # Readable
         ├── mfx/
-        │   └── mfxlt3017/.elog/elog.db   # chmod 000 (denied)
+        │   └── mfxlt3017/.elog/elog.duckdb   # chmod 000 (denied)
         └── xpp/
-            └── xppn3816/.elog/elog.db    # Readable
+            └── xppn3816/.elog/elog.duckdb    # Readable
 ```
 
 ## Architecture
@@ -60,12 +60,9 @@ Contains sensitive data:
 ### DuckDB CLI
 
 ```sql
--- Load SQLite extension
-INSTALL sqlite; LOAD sqlite;
-
--- Attach databases
-ATTACH 'data/master.db' AS master (TYPE sqlite);
-ATTACH 'data/experiments/cxi/cxi25410/.elog/elog.db' AS cxi25410 (TYPE sqlite);
+-- Attach databases (native DuckDB format, no extension needed)
+ATTACH 'data/master.duckdb' AS master;
+ATTACH 'data/experiments/cxi/cxi25410/.elog/elog.duckdb' AS cxi25410;
 
 -- Query
 SELECT * FROM cxi25410.runs LIMIT 5;
@@ -87,7 +84,7 @@ GROUP BY d.detector_name;
 ```python
 from src.federated_elog import FederatedElog
 
-with FederatedElog('data/master.db') as elog:
+with FederatedElog('data/master.duckdb') as elog:
     # List all experiments
     experiments = elog.list_experiments()
 
@@ -108,7 +105,7 @@ with FederatedElog('data/master.db') as elog:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| DuckDB ATTACH SQLite | ✓ Works | No limit on attached DBs (unlike SQLite's 125) |
+| Native DuckDB ATTACH | ✓ Works | No limit on attached DBs (unlike SQLite's 125) |
 | Permission enforcement | ✓ Works | Filesystem ACLs gate access at query time |
 | Cross-DB queries | ✓ Works | UNION ALL, JOINs across schemas |
 | Graceful denial handling | ✓ Works | Skipped experiments reported in result |
@@ -116,16 +113,11 @@ with FederatedElog('data/master.db') as elog:
 
 ## Known Issues
 
-1. **DuckDB introspection on attached SQLite**
-   - `PRAGMA table_info()` throws internal error
-   - `information_schema` returns empty for attached tables
-   - Workaround: use sqlite3 directly for schema inspection
-
-2. **DuckDB CLI not available via pip/uv**
+1. **DuckDB CLI not available via pip/uv**
    - Must download binary from GitHub releases
    - Binary located at `bin/duckdb`
 
-3. **Lazy permission check**
+2. **Lazy permission check**
    - DuckDB's ATTACH succeeds even for unreadable files
    - Error occurs at query time, not attach time
    - Python wrapper pre-checks with `os.access()` for better UX
@@ -138,7 +130,7 @@ UV_CACHE_DIR=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/.UV_CACHE \
   uv run python3 src/create_prototype_data.py
 
 # Set permission denial on mfxlt3017
-chmod 000 data/experiments/mfx/mfxlt3017/.elog/elog.db
+chmod 000 data/experiments/mfx/mfxlt3017/.elog/elog.duckdb
 ```
 
 ## Source Data
