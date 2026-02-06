@@ -13,3 +13,9 @@ __pycache__/
 # IDE
 .idea/
 .vscode/
+
+# PostgreSQL local server (setup_postgres.sh)
+pg_env/
+pg_data/
+pg_logs/
+pg_tools/
