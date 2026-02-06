@@ -1,146 +1,104 @@
-# Federated Elog-Copilot
+# PostgreSQL Elog-Copilot
 
-A prototype for permission-gated, per-experiment elog databases using native DuckDB format.
+A prototype for permission-gated elog access using PostgreSQL Row-Level Security (RLS).
 
 ## Quick Start
 
 ```bash
-cd /sdf/data/lcls/ds/prj/prjdat21/results/cwang31/elog-copilot-federated-b
+cd /sdf/data/lcls/ds/prj/prjdat21/results/cwang31/elog-copilot-postgres
 
-# Run the test suite
-UV_CACHE_DIR=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/.UV_CACHE \
-  uv run --with duckdb python3 test_prototype.py
+# Connect to test database
+pg_env/bin/psql -h /tmp -p 5434 -d elog_prototype
 
-# Interactive DuckDB CLI
-./bin/duckdb
+# Query (RLS automatically filters by user's permissions)
+SELECT * FROM runs WHERE experiment_id = 'mfx101232725';
+SELECT experiment_id, COUNT(*) FROM runs GROUP BY experiment_id;
 ```
 
 ## Project Structure
 
 ```
-elog-copilot-federated/
-├── CLAUDE.md                 # This file
-├── HANDOFF.md                # Design document and rationale
-├── bin/
-│   └── duckdb                # DuckDB CLI binary (v1.1.3)
-├── src/
-│   ├── create_prototype_data.py   # Extracts data from centralized DB
-│   └── federated_elog.py          # Python query layer
-├── test_prototype.py         # Test suite
-└── data/
-    ├── master.duckdb         # Public index (experiment IDs, paths, detectors)
-    └── experiments/
-        ├── cxi/
-        │   ├── cxi25410/.elog/elog.duckdb    # Readable
-        │   └── cxilx8720/.elog/elog.duckdb   # Readable
-        ├── mfx/
-        │   └── mfxlt3017/.elog/elog.duckdb   # chmod 000 (denied)
-        └── xpp/
-            └── xppn3816/.elog/elog.duckdb    # Readable
+elog-copilot-postgres/
+├── CLAUDE.md
+├── docs/
+│   ├── postgres-rls-design.md
+│   └── 2026_0205_1727-progress.md
+├── sql/
+│   ├── 01_schema.sql
+│   ├── 02_rls_policies.sql
+│   ├── 03_test_data.sql
+│   └── 04_test_users.sql
+└── scripts/
+    ├── setup_postgres.sh
+    ├── migrate_sqlite_to_postgres.py
+    └── verify_rls.sh
 ```
 
 ## Architecture
 
-### Master DB (public, readable by all)
-Contains only non-sensitive discovery data:
-- `experiment_index`: experiment_id, instrument, db_path
-- `detector_catalog`: shared detector names
-- `schema_info`: version tracking
+### Single Database with RLS
 
-### Experiment DBs (permission-gated by filesystem ACLs)
-Contains sensitive data:
-- `experiment`: PI name, email, description
-- `runs`, `run_production_data`, `run_detectors`
-- `logbook`: timestamped entries with content
-- `questionnaire`: proposal details
-- `workflows`: analysis workflow definitions
+```
+┌─────────────────────────────────────────────────────┐
+│                 PostgreSQL Server                    │
+│                                                     │
+│  Tables: experiments, runs, logbook, detectors...   │
+│  RLS Policies: Filter by user's experiment access   │
+│                                                     │
+│  User A (staff_user): sees all ~1842 experiments    │
+│  User B (pi_user): sees 1 experiment                │
+│  User C (collab_user): sees 5 experiments           │
+│  (Same tables, different views based on role)       │
+└─────────────────────────────────────────────────────┘
+```
 
-## Usage Examples
-
-### DuckDB CLI
+### Permission Model
 
 ```sql
--- Attach databases (native DuckDB format, no extension needed)
-ATTACH 'data/master.duckdb' AS master;
-ATTACH 'data/experiments/cxi/cxi25410/.elog/elog.duckdb' AS cxi25410;
-
--- Query
-SELECT * FROM cxi25410.runs LIMIT 5;
-
--- Cross-experiment query
-SELECT 'cxi25410' as exp, COUNT(*) FROM cxi25410.runs
-UNION ALL
-SELECT 'cxilx8720', COUNT(*) FROM cxilx8720.runs;
-
--- Join with master catalog
-SELECT d.detector_name, COUNT(*) as usage
-FROM cxi25410.run_detectors rd
-JOIN master.detector_catalog d ON rd.detector_id = d.detector_id
-GROUP BY d.detector_name;
+-- Users see only experiments they have access to
+CREATE POLICY experiment_access ON runs
+    USING (experiment_id IN (
+        SELECT experiment_id FROM user_experiment_access
+        WHERE username = current_user
+    ));
 ```
 
-### Python API
+### Key Tables
 
-```python
-from src.federated_elog import FederatedElog
+| Table | Purpose |
+|-------|---------|
+| `experiments` | Experiment metadata (PI, dates, description) |
+| `runs` | Run numbers, timestamps |
+| `run_production_data` | Event counts, file sizes |
+| `logbook` | Timestamped log entries |
+| `questionnaire` | Proposal/configuration details |
+| `user_experiment_access` | Maps users → experiments they can access |
 
-with FederatedElog('data/master.duckdb') as elog:
-    # List all experiments
-    experiments = elog.list_experiments()
+## Key Differences from DuckDB Approach
 
-    # Query single experiment
-    result = elog.query_experiment('cxi25410',
-        'SELECT run_number FROM runs LIMIT 5')
-
-    # Cross-experiment query (handles permission denial gracefully)
-    result = elog.query_cross_experiment(
-        ['cxi25410', 'mfxlt3017', 'xppn3816'],
-        'SELECT run_number FROM {exp}.runs LIMIT 3'
-    )
-    print(f"Attached: {result.attached_experiments}")
-    print(f"Skipped: {result.skipped_experiments}")
-```
-
-## Key Findings
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Native DuckDB ATTACH | ✓ Works | No limit on attached DBs (unlike SQLite's 125) |
-| Permission enforcement | ✓ Works | Filesystem ACLs gate access at query time |
-| Cross-DB queries | ✓ Works | UNION ALL, JOINs across schemas |
-| Graceful denial handling | ✓ Works | Skipped experiments reported in result |
-| Master/experiment separation | ✓ Works | Sensitive data only in experiment DBs |
-
-## Known Issues
-
-1. **DuckDB CLI not available via pip/uv**
-   - Must download binary from GitHub releases
-   - Binary located at `bin/duckdb`
-
-2. **Lazy permission check**
-   - DuckDB's ATTACH succeeds even for unreadable files
-   - Error occurs at query time, not attach time
-   - Python wrapper pre-checks with `os.access()` for better UX
-
-## Recreating Test Data
-
-```bash
-# Regenerate from centralized DB
-UV_CACHE_DIR=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/.UV_CACHE \
-  uv run python3 src/create_prototype_data.py
-
-# Set permission denial on mfxlt3017
-chmod 000 data/experiments/mfx/mfxlt3017/.elog/elog.duckdb
-```
+| Aspect | DuckDB Federated | PostgreSQL RLS |
+|--------|------------------|----------------|
+| Data location | Per-experiment files | Centralized |
+| Permission source | Filesystem ACLs | Database roles/policies |
+| Query experience | Need ATTACH | Just query |
+| CLI latency | ~7s for 1800 experiments | Instant |
+| Scaling | Files per experiment | Single DB |
+| Server required | No (but daemon helps) | Yes |
 
 ## Source Data
 
-Centralized DB: `/sdf/group/lcls/ds/dm/apps/dev/data/elog-copilot/elog_2026_0202_2031.db`
+Centralized SQLite: `/sdf/group/lcls/ds/dm/apps/dev/data/elog-copilot/elog-copilot.db` (symlink to latest)
 
-## Next Steps
+## Related Branch
 
-See HANDOFF.md Section 7 "Prototype Tasks" for the full roadmap. Key items:
-- Migration script for all 1,800+ experiments
-- Incremental sync mechanism
-- Performance testing with many attached DBs
-- Integration with elogfetch for writes
+DuckDB federated approach: `branch-b` in `../elog-copilot-federated-b/`
+
+## Status
+
+**Working prototype** - PG 16 running locally, ~4.85M rows migrated, RLS verified (15/15 tests).
+
+## Others
+
+**elog-copilot** infrastructure codes: 
+- Path: `/sdf/group/lcls/ds/dm/apps/dev/tools/elog-copilot`
+- It handles data fetching, and ingestion to sqlitedb.
