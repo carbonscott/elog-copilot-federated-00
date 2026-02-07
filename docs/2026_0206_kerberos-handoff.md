@@ -1,7 +1,7 @@
 # Handoff: Kerberos-Aware PostgreSQL Setup
 
 **Date:** 2026-02-06
-**Owner:** Chunhui Wang (cwang31)
+**Owner:** Cong Wang (cwang31)
 **For:** Intern starting Kerberos integration work
 
 ## What This Project Is
