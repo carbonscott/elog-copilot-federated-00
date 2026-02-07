@@ -1,8 +1,8 @@
-# Federated Elog-Copilot: Intern Handoff Document
+# Elog-Copilot with PostgreSQL RLS: Handoff Document
 
 **Author**: Cong Wang
-**Date**: 2026-02-04
-**Status**: Prototype Design
+**Date**: 2026-02-05
+**Status**: Design Phase (pivot from DuckDB federated approach)
 
 ---
 
@@ -11,9 +11,9 @@
 1. [Problem Statement](#1-problem-statement)
 2. [Architecture Overview](#2-architecture-overview)
 3. [Current System Analysis](#3-current-system-analysis)
-4. [Proposed Data Distribution](#4-proposed-data-distribution)
-5. [Query Layer Design](#5-query-layer-design)
-6. [Starter Code](#6-starter-code)
+4. [PostgreSQL Schema Design](#4-postgresql-schema-design)
+5. [Query Experience](#5-query-experience)
+6. [Approaches Explored](#6-approaches-explored)
 7. [Prototype Tasks](#7-prototype-tasks)
 8. [Directory Structure](#8-directory-structure)
 9. [Open Questions](#9-open-questions)
@@ -37,19 +37,20 @@ The centralized database **bypasses the filesystem permission model** that LCLS 
 
 ### The Goal
 
-Design a **federated database architecture** where:
+Design a **permission-gated query system** using PostgreSQL Row-Level Security (RLS) where:
 
-1. Each experiment's data lives in a SQLite file within that experiment's folder
-2. Filesystem ACLs (already configured per-experiment) naturally gate database access
-3. A query layer dynamically attaches only the databases the user can read
-4. Users can still run cross-experiment queries (within their permission scope)
+1. All experiment data lives in a single PostgreSQL database
+2. RLS policies automatically filter rows based on the querying user's permissions
+3. Users query normally — permission filtering is transparent
+4. Cross-experiment queries work naturally within the user's permission scope
 
 ### Why This Matters
 
-- **Security**: Leverage existing POSIX ACLs instead of building custom auth
+- **Security**: Permission enforcement at the database level, not application level
 - **Compliance**: Respect experiment-level data access policies
-- **Simplicity**: No application-level permission logic needed
-- **Auditability**: Filesystem access logs track who queried what
+- **Simplicity**: Users just query — no ATTACH, no wrappers, no special syntax
+- **Performance**: Instant queries (no per-session database setup latency)
+- **Proven**: PostgreSQL RLS is battle-tested in production systems
 
 ---
 
@@ -76,47 +77,39 @@ Design a **federated database architecture** where:
 └─────────────────────────────────────────────────────┘
 ```
 
-### Proposed Architecture (Federated)
+### Proposed Architecture (PostgreSQL with RLS)
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │                   User Query                         │
-│         "SELECT * FROM runs WHERE exp='cxilz5418'"  │
+│  "SELECT * FROM runs WHERE experiment_id='cxi...'"  │
+│  (no ATTACH, no wrappers, just SQL)                 │
 └─────────────────────┬───────────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────────┐
-│              Query Layer (DuckDB)                    │
+│              PostgreSQL Server                       │
 │                                                      │
-│  1. Parse SQL → identify experiments needed          │
-│  2. Lookup paths in master.db                        │
-│  3. ATTACH each experiment DB (filesystem gates)     │
-│  4. Execute query across attached DBs                │
-│  5. DETACH and return results                        │
-└─────────────────────┬───────────────────────────────┘
-                      │
-        ┌─────────────┼─────────────┐
-        │             │             │
-        ▼             ▼             ▼
-┌───────────┐  ┌───────────┐  ┌───────────┐
-│ master.db │  │           │  │           │
-│ (central) │  │           │  │           │
-│           │  │           │  │           │
-│ - Index   │  │           │  │           │
-│ - Schema  │  │           │  │           │
-│ - Catalog │  │           │  │           │
-└───────────┘  │           │  │           │
-               │           │  │           │
-               ▼           ▼  ▼           ▼
-┌─────────────────────────────────────────────────────┐
-│          Experiment Databases (per-folder)           │
-│                                                      │
-│  /sdf/data/lcls/ds/cxi/cxilz5418/.elog/elog.db     │
-│  /sdf/data/lcls/ds/mfx/mfx00123/.elog/elog.db      │
-│  /sdf/data/lcls/ds/xpp/xpp12345/.elog/elog.db      │
-│  ...                                                 │
-│                                                      │
-│  Each inherits folder's ACL permissions!             │
+│  ┌─────────────────────────────────────────────┐    │
+│  │              Data Tables                     │    │
+│  │  experiments, runs, logbook, questionnaire   │    │
+│  │  run_production_data, run_detectors, ...     │    │
+│  └─────────────────────────────────────────────┘    │
+│                       │                              │
+│                       ▼                              │
+│  ┌─────────────────────────────────────────────┐    │
+│  │         Row-Level Security Policies          │    │
+│  │  Each table: USING (experiment_id IN (       │    │
+│  │    SELECT experiment_id                      │    │
+│  │    FROM user_experiment_access               │    │
+│  │    WHERE username = current_user))           │    │
+│  └─────────────────────────────────────────────┘    │
+│                       │                              │
+│           ┌───────────┼───────────┐                  │
+│           ▼           ▼           ▼                  │
+│        User A      User B      User C               │
+│      (1800 exp)   (3 exp)    (50 exp)               │
+│      Same query → different rows returned            │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -124,12 +117,11 @@ Design a **federated database architecture** where:
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Query Engine | **DuckDB** | No ATTACH limit (SQLite max 125), native SQLite extension |
-| Hierarchy | **2-tier** (Master + Experiment) | Simpler than 3-tier, sufficient for per-experiment permissions |
-| DB Location | `<exp_folder>/.elog/elog.db` | Hidden folder, inherits parent ACLs |
-| Master Location | Central deploy directory | Readable by all, contains only index data |
-
-**Key Insight**: Permissions are per-experiment, not per-instrument. User access to `mfx00123` does not imply access to `mfx00456`. Each experiment folder's ACL independently controls who can read its `.elog/elog.db`.
+| Database Engine | **PostgreSQL** | Native RLS, proven at scale, standard tooling |
+| Permission Model | **RLS policies** | Transparent to users, enforced at DB level |
+| Data Layout | **Single centralized DB** | No ATTACH complexity, standard SQL |
+| Permission Source | **`user_experiment_access` table** | Synced from filesystem ACLs or LDAP |
+| Auth | **TBD** | Peer auth, Kerberos, or password — open question |
 
 ---
 
@@ -276,885 +268,381 @@ The `elogfetch` tool pulls from 7 API endpoints at `https://pswww.slac.stanford.
 
 ---
 
-## 4. Proposed Data Distribution
+## 4. PostgreSQL Schema Design
 
-### Master Database (Central, Public)
+### Overview
 
-**Location**: `/sdf/group/lcls/ds/dm/apps/dev/data/elog-copilot-federated/master.db`
+All experiment data lives in a single PostgreSQL database. Row-Level Security policies on each table ensure users only see experiments they have access to.
 
-**Purpose**: Discovery index only, no sensitive data
+Full schema definitions: **`sql/01_schema.sql`**
+Full RLS policies: **`sql/02_rls_policies.sql`**
 
-```sql
--- Experiment discovery (public info only)
-CREATE TABLE experiment_index (
-    experiment_id TEXT PRIMARY KEY,
-    instrument TEXT NOT NULL,
-    name TEXT,
-    start_time DATETIME,
-    end_time DATETIME,
-    db_path TEXT NOT NULL           -- Path to experiment's elog.db
-);
+### Core Tables
 
--- Shared detector catalog
-CREATE TABLE detector_catalog (
-    detector_id INTEGER PRIMARY KEY,
-    detector_name TEXT UNIQUE NOT NULL,
-    description TEXT
-);
-
--- Schema version for migrations
-CREATE TABLE schema_info (
-    version INTEGER PRIMARY KEY,
-    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
--- Sync metadata
-CREATE TABLE sync_metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-```
-
-**What's NOT in master**: PI names, emails, logbook content, questionnaire details
-
-### Experiment Database (Per-Folder, Permission-Gated)
-
-**Location**: `/sdf/data/lcls/ds/<hutch>/<experiment>/.elog/elog.db`
-
-**Example**: `/sdf/data/lcls/ds/cxi/cxilz5418/.elog/elog.db`
+The PostgreSQL schema mirrors the existing SQLite schema with minor adjustments:
 
 ```sql
--- Full experiment details
-CREATE TABLE experiment (
+CREATE TABLE experiments (
     experiment_id TEXT PRIMARY KEY,
     name TEXT,
     instrument TEXT,
-    start_time DATETIME,
-    end_time DATETIME,
+    start_time TIMESTAMPTZ,
+    end_time TIMESTAMPTZ,
     pi TEXT,
     pi_email TEXT,
     leader_account TEXT,
-    description TEXT,
-    slack_channels TEXT,
-    analysis_queues TEXT,
-    urawi_proposal TEXT
+    description TEXT
 );
 
--- Runs (same schema as current)
 CREATE TABLE runs (
-    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_number INTEGER NOT NULL UNIQUE,
-    start_time DATETIME,
-    end_time DATETIME
+    run_id SERIAL PRIMARY KEY,
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+    run_number INTEGER NOT NULL,
+    start_time TIMESTAMPTZ,
+    end_time TIMESTAMPTZ,
+    UNIQUE(experiment_id, run_number)
 );
 
--- Run production data
-CREATE TABLE run_production_data (
-    run_data_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES runs(run_id),
-    n_events INTEGER,
-    n_damaged INTEGER,
-    n_dropped INTEGER,
-    prod_start DATETIME,
-    prod_end DATETIME,
-    number_of_files INTEGER,
-    total_size_bytes INTEGER
-);
-
--- Run-detector mapping (references master's detector_catalog)
-CREATE TABLE run_detectors (
-    run_detector_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES runs(run_id),
-    detector_id INTEGER NOT NULL,  -- FK to master.detector_catalog
-    status TEXT NOT NULL,
-    UNIQUE(run_id, detector_id)
-);
-
--- Logbook entries
-CREATE TABLE logbook (
-    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER REFERENCES runs(run_id),
-    timestamp DATETIME NOT NULL,
-    content TEXT,
-    tags TEXT,
-    author TEXT
-);
-
--- Questionnaire
-CREATE TABLE questionnaire (
-    questionnaire_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    proposal TEXT,
-    category TEXT NOT NULL,
-    field_id TEXT NOT NULL UNIQUE,
-    field_name TEXT,
-    field_value TEXT,
-    modified_time DATETIME,
-    modified_uid TEXT
-);
-
--- Workflows
-CREATE TABLE workflows (
-    workflow_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    mongo_id TEXT,
-    name TEXT NOT NULL,
-    executable TEXT,
-    trigger TEXT,
-    location TEXT,
-    parameters TEXT,
-    run_param_name TEXT,
-    run_param_value TEXT,
-    run_as_user TEXT
-);
-
--- Local metadata
-CREATE TABLE metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
+-- See sql/01_schema.sql for complete definitions of:
+-- run_production_data, logbook, detectors, run_detectors,
+-- questionnaire, workflows
 ```
 
-**Note**: `experiment_id` is implicit (one per DB), so tables don't need FK to Experiment.
+### Permission Table
+
+The key addition to enable RLS:
+
+```sql
+CREATE TABLE user_experiment_access (
+    id SERIAL PRIMARY KEY,
+    username TEXT NOT NULL,
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+    access_level TEXT DEFAULT 'read',  -- 'read', 'write', 'admin'
+    granted_at TIMESTAMPTZ DEFAULT now(),
+    granted_by TEXT,
+    UNIQUE(username, experiment_id)
+);
+
+-- Indexes for RLS performance
+CREATE INDEX idx_user_access_username ON user_experiment_access(username);
+CREATE INDEX idx_user_access_experiment ON user_experiment_access(experiment_id);
+```
+
+### RLS Policy Pattern
+
+Every sensitive table gets the same policy pattern:
+
+```sql
+ALTER TABLE experiments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE experiments FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY experiment_select ON experiments
+    FOR SELECT
+    USING (experiment_id IN (
+        SELECT experiment_id FROM user_experiment_access
+        WHERE username = current_user
+    ));
+```
+
+For tables without a direct `experiment_id` column (like `run_production_data`), the policy joins through `runs`:
+
+```sql
+CREATE POLICY run_prod_select ON run_production_data
+    FOR SELECT
+    USING (run_id IN (
+        SELECT r.run_id FROM runs r
+        JOIN user_experiment_access ua ON r.experiment_id = ua.experiment_id
+        WHERE ua.username = current_user
+    ));
+```
+
+The `detectors` table has **no RLS** — it's a shared catalog visible to all users.
 
 ---
 
-## 5. Query Layer Design
+## 5. Query Experience
 
-### Core Concept
+### Users Just Query
 
-Use **DuckDB** as the query engine because:
-1. No limit on attached databases (SQLite max is 125)
-2. Native SQLite extension: `ATTACH 'file.db' (TYPE sqlite)`
-3. Cross-database queries work seamlessly
-4. Can also read Parquet files (useful for lcls-catalog integration)
+With PostgreSQL RLS, there is no setup step. Users connect and query:
 
-### Query Flow
+```sql
+-- Cross-experiment: automatically limited to user's accessible experiments
+SELECT experiment_id, COUNT(*) as run_count
+FROM runs
+GROUP BY experiment_id;
 
-```
-User SQL Query
-      │
-      ▼
-┌─────────────────────────────────────┐
-│  1. PARSE: Extract experiment IDs   │
-│     from WHERE clauses, JOINs, etc. │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│  2. LOOKUP: Get db_path from        │
-│     master.experiment_index         │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│  3. ATTACH: For each experiment     │
-│     - Check filesystem access       │
-│     - DuckDB ATTACH if accessible   │
-│     - Skip if permission denied     │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│  4. REWRITE: Transform query to     │
-│     use attached schema names       │
-│     e.g., exp_cxilz5418.runs        │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│  5. EXECUTE: Run rewritten query    │
-│     DuckDB handles cross-DB joins   │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│  6. DETACH: Clean up attached DBs   │
-│     Return results to user          │
-└─────────────────────────────────────┘
+-- Search logbooks (only searches user's accessible experiments)
+SELECT * FROM logbook
+WHERE content LIKE '%alignment%'
+ORDER BY timestamp DESC
+LIMIT 10;
+
+-- Join across tables (RLS applied on each table independently)
+SELECT DISTINCT e.experiment_id, e.pi
+FROM experiments e
+JOIN runs r ON e.experiment_id = r.experiment_id
+JOIN run_detectors rd ON r.run_id = rd.run_id
+JOIN detectors d ON rd.detector_id = d.detector_id
+WHERE d.detector_name LIKE '%jungfrau%';
 ```
 
-### Permission Check Strategy
+### Comparison with DuckDB Approach
 
-**Option A: Try and Catch** (Recommended for prototype)
-```python
-try:
-    conn.execute(f"ATTACH '{db_path}' AS {exp_id} (TYPE sqlite)")
-    attached.append(exp_id)
-except Exception as e:
-    # Permission denied or file not found
-    skipped.append((exp_id, str(e)))
-```
-
-**Option B: Pre-check with os.access**
-```python
-if os.access(db_path, os.R_OK):
-    conn.execute(f"ATTACH '{db_path}' AS {exp_id} (TYPE sqlite)")
-```
-
-Option A is simpler and handles edge cases (file exists but unreadable, etc.).
+| Aspect | DuckDB Federated | PostgreSQL RLS |
+|--------|------------------|----------------|
+| Setup per session | ATTACH ~7s for 1800 DBs | None |
+| Query syntax | Schema-prefixed (`exp_cxi.runs`) | Standard (`runs`) |
+| Cross-experiment query | Manual UNION ALL or views | Just GROUP BY |
+| Permission errors | Try/catch per ATTACH | Silent filtering (empty result) |
+| CLI experience | Wrapper script needed | `psql` works directly |
+| Persistent state | None (CLI) or daemon needed | PostgreSQL server |
 
 ---
 
-## 6. Starter Code
-
-### 6.1 Query Layer Skeleton
-
-```python
-#!/usr/bin/env python3
-"""
-federated_elog.py - Federated Elog Query Layer
-
-This module provides a query interface that dynamically attaches
-experiment databases based on user permissions (filesystem ACLs).
-"""
-
-import duckdb
-import os
-import re
-from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Any
-
-
-@dataclass
-class QueryResult:
-    """Result of a federated query."""
-    data: List[Tuple]
-    columns: List[str]
-    attached_experiments: List[str]
-    skipped_experiments: List[Tuple[str, str]]  # (exp_id, reason)
-
-
-class FederatedElog:
-    """
-    Federated query layer for elog-copilot databases.
-
-    Uses DuckDB to dynamically attach per-experiment SQLite databases,
-    leveraging filesystem permissions for access control.
-    """
-
-    def __init__(self, master_db_path: str):
-        """
-        Initialize the federated query layer.
-
-        Args:
-            master_db_path: Path to the master index database
-        """
-        self.master_db_path = Path(master_db_path)
-        if not self.master_db_path.exists():
-            raise FileNotFoundError(f"Master database not found: {master_db_path}")
-
-        # Create DuckDB connection and load SQLite extension
-        self.conn = duckdb.connect(":memory:")
-        self.conn.execute("INSTALL sqlite; LOAD sqlite;")
-
-        # Attach master database
-        self.conn.execute(f"ATTACH '{self.master_db_path}' AS master (TYPE sqlite)")
-
-        # Track attached experiment databases
-        self._attached: List[str] = []
-
-    def list_experiments(self, instrument: Optional[str] = None) -> List[dict]:
-        """
-        List available experiments from master index.
-
-        Args:
-            instrument: Optional filter by instrument (e.g., 'CXI', 'MFX')
-
-        Returns:
-            List of experiment records
-        """
-        sql = "SELECT * FROM master.experiment_index"
-        if instrument:
-            sql += f" WHERE instrument = '{instrument}'"
-        sql += " ORDER BY start_time DESC"
-
-        result = self.conn.execute(sql).fetchall()
-        columns = [desc[0] for desc in self.conn.description]
-        return [dict(zip(columns, row)) for row in result]
-
-    def _extract_experiments(self, sql: str) -> List[str]:
-        """
-        Extract experiment IDs mentioned in a SQL query.
-
-        This is a simplified parser - production version should use
-        proper SQL parsing (e.g., sqlparse library).
-
-        Args:
-            sql: The SQL query string
-
-        Returns:
-            List of experiment IDs found in the query
-        """
-        # Pattern: experiment_id = 'xxx' or experiment = 'xxx' or exp = 'xxx'
-        pattern = r"(?:experiment_id|experiment|exp)\s*=\s*['\"]([^'\"]+)['\"]"
-        matches = re.findall(pattern, sql, re.IGNORECASE)
-
-        # Also check for IN clauses
-        in_pattern = r"(?:experiment_id|experiment|exp)\s+IN\s*\(([^)]+)\)"
-        in_matches = re.findall(in_pattern, sql, re.IGNORECASE)
-        for match in in_matches:
-            # Parse comma-separated values
-            values = re.findall(r"['\"]([^'\"]+)['\"]", match)
-            matches.extend(values)
-
-        return list(set(matches))
-
-    def _get_experiment_paths(self, experiment_ids: List[str]) -> List[Tuple[str, str]]:
-        """
-        Look up database paths for given experiment IDs.
-
-        Args:
-            experiment_ids: List of experiment IDs
-
-        Returns:
-            List of (experiment_id, db_path) tuples
-        """
-        if not experiment_ids:
-            return []
-
-        placeholders = ", ".join(f"'{eid}'" for eid in experiment_ids)
-        sql = f"""
-            SELECT experiment_id, db_path
-            FROM master.experiment_index
-            WHERE experiment_id IN ({placeholders})
-        """
-        return self.conn.execute(sql).fetchall()
-
-    def _attach_experiments(self, experiment_paths: List[Tuple[str, str]]) -> Tuple[List[str], List[Tuple[str, str]]]:
-        """
-        Attach experiment databases, respecting filesystem permissions.
-
-        Args:
-            experiment_paths: List of (experiment_id, db_path) tuples
-
-        Returns:
-            Tuple of (attached_ids, skipped_with_reasons)
-        """
-        attached = []
-        skipped = []
-
-        for exp_id, db_path in experiment_paths:
-            # Skip if already attached
-            if exp_id in self._attached:
-                attached.append(exp_id)
-                continue
-
-            # Try to attach - filesystem permissions will gate access
-            try:
-                self.conn.execute(f"ATTACH '{db_path}' AS exp_{exp_id} (TYPE sqlite)")
-                self._attached.append(exp_id)
-                attached.append(exp_id)
-            except Exception as e:
-                error_msg = str(e)
-                if "Permission denied" in error_msg or "unable to open" in error_msg.lower():
-                    skipped.append((exp_id, "Permission denied"))
-                else:
-                    skipped.append((exp_id, error_msg))
-
-        return attached, skipped
-
-    def _detach_experiments(self, experiment_ids: Optional[List[str]] = None):
-        """
-        Detach experiment databases.
-
-        Args:
-            experiment_ids: Specific IDs to detach, or None for all
-        """
-        ids_to_detach = experiment_ids or self._attached.copy()
-        for exp_id in ids_to_detach:
-            if exp_id in self._attached:
-                try:
-                    self.conn.execute(f"DETACH exp_{exp_id}")
-                    self._attached.remove(exp_id)
-                except Exception:
-                    pass  # Ignore detach errors
-
-    def query(self, sql: str, auto_detach: bool = True) -> QueryResult:
-        """
-        Execute a federated query across experiment databases.
-
-        Args:
-            sql: SQL query (can reference experiment tables)
-            auto_detach: Whether to detach databases after query
-
-        Returns:
-            QueryResult with data and metadata
-        """
-        # Extract experiment IDs from query
-        experiment_ids = self._extract_experiments(sql)
-
-        # Look up paths in master
-        experiment_paths = self._get_experiment_paths(experiment_ids)
-
-        # Attach databases (permission check happens here)
-        attached, skipped = self._attach_experiments(experiment_paths)
-
-        # Execute query
-        try:
-            result = self.conn.execute(sql)
-            data = result.fetchall()
-            columns = [desc[0] for desc in result.description] if result.description else []
-        except Exception as e:
-            if auto_detach:
-                self._detach_experiments(attached)
-            raise
-
-        # Clean up
-        if auto_detach:
-            self._detach_experiments(attached)
-
-        return QueryResult(
-            data=data,
-            columns=columns,
-            attached_experiments=attached,
-            skipped_experiments=skipped
-        )
-
-    def query_experiment(self, experiment_id: str, sql: str) -> QueryResult:
-        """
-        Query a single experiment database.
-
-        Convenience method that attaches one experiment and runs a query.
-
-        Args:
-            experiment_id: The experiment to query
-            sql: SQL query (tables without schema prefix)
-
-        Returns:
-            QueryResult
-        """
-        # Get path
-        paths = self._get_experiment_paths([experiment_id])
-        if not paths:
-            raise ValueError(f"Experiment not found: {experiment_id}")
-
-        # Attach
-        attached, skipped = self._attach_experiments(paths)
-        if skipped:
-            raise PermissionError(f"Cannot access experiment: {skipped[0][1]}")
-
-        # Rewrite SQL to use schema prefix
-        prefixed_sql = sql
-        for table in ['runs', 'logbook', 'questionnaire', 'workflows',
-                      'run_production_data', 'run_detectors', 'experiment']:
-            prefixed_sql = re.sub(
-                rf'\b{table}\b',
-                f'exp_{experiment_id}.{table}',
-                prefixed_sql,
-                flags=re.IGNORECASE
-            )
-
-        # Execute
-        try:
-            result = self.conn.execute(prefixed_sql)
-            data = result.fetchall()
-            columns = [desc[0] for desc in result.description] if result.description else []
-        finally:
-            self._detach_experiments([experiment_id])
-
-        return QueryResult(
-            data=data,
-            columns=columns,
-            attached_experiments=attached,
-            skipped_experiments=skipped
-        )
-
-    def close(self):
-        """Clean up resources."""
-        self._detach_experiments()
-        self.conn.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-        return False
-
-
-# Example usage
-if __name__ == "__main__":
-    # This is for testing with dummy data
-    master_path = "data/master.db"
-
-    with FederatedElog(master_path) as elog:
-        # List all experiments
-        experiments = elog.list_experiments()
-        print(f"Found {len(experiments)} experiments in index")
-
-        # Query a specific experiment
-        try:
-            result = elog.query_experiment(
-                "cxilz5418",
-                "SELECT run_number, start_time FROM runs ORDER BY run_number LIMIT 10"
-            )
-            print(f"Runs: {result.data}")
-        except PermissionError as e:
-            print(f"Access denied: {e}")
-```
-
-### 6.2 Schema Setup Script
-
-```python
-#!/usr/bin/env python3
-"""
-setup_schemas.py - Create master and experiment database schemas
-"""
-
-import sqlite3
-from pathlib import Path
-
-
-MASTER_SCHEMA = """
--- Experiment discovery index (public)
-CREATE TABLE IF NOT EXISTS experiment_index (
-    experiment_id TEXT PRIMARY KEY,
-    instrument TEXT NOT NULL,
-    name TEXT,
-    start_time TEXT,
-    end_time TEXT,
-    db_path TEXT NOT NULL
-);
-
--- Shared detector catalog
-CREATE TABLE IF NOT EXISTS detector_catalog (
-    detector_id INTEGER PRIMARY KEY,
-    detector_name TEXT UNIQUE NOT NULL,
-    description TEXT
-);
-
--- Schema version
-CREATE TABLE IF NOT EXISTS schema_info (
-    version INTEGER PRIMARY KEY,
-    applied_at TEXT DEFAULT (datetime('now'))
-);
-
--- Sync metadata
-CREATE TABLE IF NOT EXISTS sync_metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-
--- Insert schema version
-INSERT OR REPLACE INTO schema_info (version) VALUES (1);
-"""
-
-
-EXPERIMENT_SCHEMA = """
--- Experiment details
-CREATE TABLE IF NOT EXISTS experiment (
-    experiment_id TEXT PRIMARY KEY,
-    name TEXT,
-    instrument TEXT,
-    start_time TEXT,
-    end_time TEXT,
-    pi TEXT,
-    pi_email TEXT,
-    leader_account TEXT,
-    description TEXT,
-    slack_channels TEXT,
-    analysis_queues TEXT,
-    urawi_proposal TEXT
-);
-
--- Runs
-CREATE TABLE IF NOT EXISTS runs (
-    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_number INTEGER NOT NULL UNIQUE,
-    start_time TEXT,
-    end_time TEXT
-);
-
--- Run production data
-CREATE TABLE IF NOT EXISTS run_production_data (
-    run_data_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES runs(run_id),
-    n_events INTEGER,
-    n_damaged INTEGER,
-    n_dropped INTEGER,
-    prod_start TEXT,
-    prod_end TEXT,
-    number_of_files INTEGER,
-    total_size_bytes INTEGER
-);
-
--- Run-detector mapping
-CREATE TABLE IF NOT EXISTS run_detectors (
-    run_detector_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES runs(run_id),
-    detector_id INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    UNIQUE(run_id, detector_id)
-);
-
--- Logbook
-CREATE TABLE IF NOT EXISTS logbook (
-    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER REFERENCES runs(run_id),
-    timestamp TEXT NOT NULL,
-    content TEXT,
-    tags TEXT,
-    author TEXT
-);
-
--- Questionnaire
-CREATE TABLE IF NOT EXISTS questionnaire (
-    questionnaire_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    proposal TEXT,
-    category TEXT NOT NULL,
-    field_id TEXT NOT NULL UNIQUE,
-    field_name TEXT,
-    field_value TEXT,
-    modified_time TEXT,
-    modified_uid TEXT
-);
-
--- Workflows
-CREATE TABLE IF NOT EXISTS workflows (
-    workflow_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    mongo_id TEXT,
-    name TEXT NOT NULL,
-    executable TEXT,
-    trigger TEXT,
-    location TEXT,
-    parameters TEXT,
-    run_param_name TEXT,
-    run_param_value TEXT,
-    run_as_user TEXT
-);
-
--- Local metadata
-CREATE TABLE IF NOT EXISTS metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_runs_number ON runs(run_number);
-CREATE INDEX IF NOT EXISTS idx_logbook_run ON logbook(run_id);
-CREATE INDEX IF NOT EXISTS idx_logbook_timestamp ON logbook(timestamp);
-"""
-
-
-def create_master_db(path: Path):
-    """Create master database with schema."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.executescript(MASTER_SCHEMA)
-    conn.commit()
-    conn.close()
-    print(f"Created master database: {path}")
-
-
-def create_experiment_db(path: Path, experiment_id: str):
-    """Create experiment database with schema."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.executescript(EXPERIMENT_SCHEMA)
-    # Insert experiment_id into metadata
-    conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('experiment_id', ?)",
-                 (experiment_id,))
-    conn.commit()
-    conn.close()
-    print(f"Created experiment database: {path}")
-
-
-if __name__ == "__main__":
-    # Create dummy data structure for testing
-    base = Path("data")
-
-    # Master DB
-    create_master_db(base / "master.db")
-
-    # Experiment DBs
-    experiments = [
-        ("cxi", "cxilz5418"),
-        ("cxi", "cxi00123"),
-        ("mfx", "mfx00456"),
-    ]
-
-    for hutch, exp_id in experiments:
-        exp_path = base / "experiments" / hutch / exp_id / ".elog" / "elog.db"
-        create_experiment_db(exp_path, exp_id)
-
-        # Register in master
-        conn = sqlite3.connect(base / "master.db")
-        conn.execute("""
-            INSERT OR REPLACE INTO experiment_index
-            (experiment_id, instrument, name, db_path)
-            VALUES (?, ?, ?, ?)
-        """, (exp_id, hutch.upper(), exp_id, str(exp_path)))
-        conn.commit()
-        conn.close()
-
-    print("\nDummy data structure created!")
-```
+## 6. Approaches Explored
+
+Before settling on PostgreSQL RLS, we explored several approaches. This section documents each for historical reference.
+
+### Summary
+
+| # | Approach | Status | Key Finding | Why Not (or Why Chosen) |
+|---|----------|--------|-------------|-------------------------|
+| 1 | DuckDB Federated | Prototyped | Works end-to-end | ~7s ATTACH for 1800 DBs, no persistent CLI session |
+| 2 | DuckDB Views | Tested | Views are stored queries, not data | Require ATTACH each session — same latency problem |
+| 3 | CLI Dynamic Wrapper | Prototyped | `.bail off` + `os.access()` filtering | Not persistent, regenerates each invocation |
+| 4 | Per-user SQLite | Analyzed | Simple once built | ~71GB storage for 1000 users, stale permission revocation |
+| 5 | DuckDB Daemon | Considered | Would solve persistent session | Over-engineering; if need server, just use Postgres |
+| 6 | **PostgreSQL RLS** | **Chosen** | Native permission filtering, instant queries | Requires server infrastructure |
+
+### Approach 1: DuckDB Federated (per-experiment files)
+
+**Concept**: Each experiment gets its own DuckDB file at `/sdf/data/lcls/ds/<hutch>/<exp>/.elog-metadata/elog.duckdb`. Filesystem ACLs gate access. A master index tracks all experiment paths. At query time, ATTACH only accessible databases.
+
+**What worked**:
+- Permission gating via filesystem ACLs confirmed working
+- Cross-experiment queries via UNION ALL and JOINs across schemas
+- Graceful error handling when experiments are inaccessible
+- 4 real experiments deployed and tested successfully
+
+**What didn't scale**:
+- ATTACH latency: ~7s for 1800 databases (even with parallel ATTACH due to internal locking)
+- No persistent session in DuckDB CLI — must re-ATTACH every invocation
+- `os.access()` checks are fast (~0.03s for 1800) but the ATTACH step is the bottleneck
+
+**Code**: `src/federated_elog.py`, `src/elog_extractor.py`, `src/master_builder.py` (on `branch-b`)
+**Docs**: `docs/2026-02-04-candidate-experiments-research.md` (on `branch-b`)
+
+### Approach 2: DuckDB Views
+
+**Concept**: Create VIEWs in a DuckDB file that aggregate across experiments, e.g., `CREATE VIEW all_runs AS SELECT * FROM exp_cxi.runs UNION ALL SELECT * FROM exp_mfx.runs`.
+
+**What we found**:
+- Views are stored queries, not materialized data
+- The underlying schemas must be ATTACHed each session for views to work
+- If ANY referenced experiment is inaccessible, the entire view fails (no graceful partial results)
+
+**Conclusion**: Views don't solve the ATTACH problem — they just defer it.
+
+**Docs**: `docs/2026-02-04-unified-query-layer-discussion.md` (on `branch-b`)
+
+### Approach 3: CLI Dynamic Wrapper
+
+**Concept**: A shell script that (1) runs `os.access()` on all experiment paths, (2) generates an init.sql that ATTACHes only accessible ones and creates VIEWs, (3) runs user query via `./bin/duckdb -init init.sql`.
+
+**What worked**: Functional for ad-hoc one-off queries.
+
+**Limitations**: Regenerates init.sql each invocation (full permission scan + ATTACH latency each time).
+
+**Key DuckDB features discovered**: `.bail off` continues after ATTACH errors; `grep -v "^IO Error:"` suppresses permission error output.
+
+**Docs**: `docs/2026-02-04-cli-dynamic-view-solution.md` (on `branch-b`)
+
+### Approach 4: Per-user SQLite
+
+**Concept**: Materialize a per-user SQLite database containing only the experiments each user can access. Simple queries with no permission logic at query time.
+
+**Analysis**:
+- Storage: ~71GB total (950 normal users x 10 experiments x 700KB + 50 power users x 1841 x 700KB)
+- Permission revocation is stale until next sync
+- 1000 users x 1841 experiments = 1.8M permission checks for full rebuild
+
+**Conclusion**: Storage is manageable but permission revocation staleness is a compliance concern, and the generation/sync complexity is high.
+
+**Docs**: `docs/2026-02-05-per-user-sqlite-analysis.md`, `docs/2026-02-05-0950-per-user-sqlite-pivot-discussion.md` (on `branch-b`)
+
+### Approach 5: DuckDB Daemon (Unix Socket)
+
+**Concept**: Run a persistent DuckDB process that keeps databases ATTACHed, serving queries via Unix socket. Avoids re-ATTACH latency.
+
+**Why rejected**: If we need a persistent server process, PostgreSQL is a much more proven and capable solution with native RLS, replication, monitoring, and tooling. Building a custom daemon is over-engineering.
+
+### Approach 6: PostgreSQL RLS (Chosen)
+
+**Concept**: Single PostgreSQL database with all experiment data. Row-Level Security policies filter rows based on `current_user`'s entries in `user_experiment_access` table.
+
+**Why chosen**:
+- Instant queries (no setup latency)
+- Transparent permission filtering (users just query normally)
+- Standard tooling (psql, any PostgreSQL client, BI tools)
+- Battle-tested security model
+- Built-in auth options (peer, Kerberos, LDAP)
+
+**Trade-off**: Requires PostgreSQL server infrastructure (hosting, backups, monitoring).
 
 ---
 
 ## 7. Prototype Tasks
 
-### Phase 1: Foundation (Week 1-2)
+### Phase 1: Infrastructure (Week 1-2)
 
-- [ ] **Task 1.1**: Set up development environment
-  - Install DuckDB: `pip install duckdb`
-  - Create prototype directory structure
-  - Run `setup_schemas.py` to create dummy databases
+- [ ] **Task 1.1**: Identify PostgreSQL hosting
+  - Evaluate existing LCLS PostgreSQL instances
+  - Determine if new instance is needed
+  - Decide on authentication method
 
-- [ ] **Task 1.2**: Implement basic query layer
-  - Copy `federated_elog.py` skeleton
-  - Test with dummy data
-  - Verify ATTACH/DETACH works correctly
+- [ ] **Task 1.2**: Create database and load schema
+  - Run `sql/01_schema.sql` to create tables
+  - Run `sql/02_rls_policies.sql` to enable RLS
+  - Create test users
 
-- [ ] **Task 1.3**: Test permission gating
-  - Create experiment DBs with different file permissions
-  - Verify queries fail gracefully for inaccessible DBs
-  - Document error messages
+- [ ] **Task 1.3**: Migrate data from SQLite
+  - Write migration script (SQLite → PostgreSQL)
+  - Source: `/sdf/group/lcls/ds/dm/apps/dev/data/elog-copilot/elog_2026_0204_1800.db`
+  - Verify data integrity post-migration
 
-### Phase 2: Data Migration (Week 3-4)
+### Phase 2: RLS Validation (Week 3-4)
 
-- [ ] **Task 2.1**: Write migration script
-  - Read from current centralized DB
-  - Split data by experiment_id
-  - Write to per-experiment DBs
-  - Update master index
+- [ ] **Task 2.1**: Test RLS with different user roles
+  - Staff user (access to all experiments)
+  - PI user (access to own experiments)
+  - Collaborator (access to subset)
+  - Unauthenticated (no access)
 
-- [ ] **Task 2.2**: Test with subset of real data
-  - Migrate 10-20 experiments
-  - Verify data integrity
-  - Compare query results with centralized DB
+- [ ] **Task 2.2**: Test cross-experiment queries
+  - GROUP BY experiment_id (should only show accessible)
+  - JOINs across tables (RLS on each table independently)
+  - Full-text search in logbook (only accessible entries)
 
-- [ ] **Task 2.3**: Handle edge cases
-  - Experiments with no runs
-  - Experiments with very large logbooks
-  - Detector catalog synchronization
+- [ ] **Task 2.3**: Benchmark query performance
+  - Single experiment queries with/without RLS
+  - Cross-experiment aggregations
+  - Ensure indexes support RLS policy subqueries
 
-### Phase 3: Integration (Week 5-6)
+### Phase 3: Permission Sync (Week 5-6)
 
-- [ ] **Task 3.1**: Integrate with elogfetch
-  - Modify elogfetch to write per-experiment DBs
-  - Add master index update logic
-  - Test incremental updates
+- [ ] **Task 3.1**: Design permission sync mechanism
+  - Map filesystem ACLs to `user_experiment_access` entries
+  - Evaluate: `os.access()` probing vs LDAP group mapping vs API
+  - Define sync frequency (real-time vs nightly vs on-demand)
 
-- [ ] **Task 3.2**: Cross-experiment queries
-  - Implement `query_multiple_experiments()` method
-  - Handle UNION ALL generation
-  - Test with instrument-wide queries
+- [ ] **Task 3.2**: Implement permission sync script
+  - Read experiment directory permissions
+  - Map to usernames
+  - Upsert into `user_experiment_access`
+  - Handle permission revocations
 
-- [ ] **Task 3.3**: Performance testing
-  - Benchmark query latency
-  - Test with many attached DBs
-  - Identify bottlenecks
+### Phase 4: Integration (Week 7-8)
 
-### Phase 4: Production Readiness (Week 7-8)
+- [ ] **Task 4.1**: Data sync from elog source
+  - Incremental updates from elogfetch
+  - Handle new experiments, new runs, logbook entries
+  - Conflict resolution strategy
 
-- [ ] **Task 4.1**: Error handling & logging
-  - Add comprehensive error messages
-  - Log permission denials (for audit)
-  - Handle network/filesystem failures
+- [ ] **Task 4.2**: Integration testing
+  - End-to-end: user connects → queries → sees correct data
+  - Permission changes propagate correctly
+  - Performance under concurrent users
 
-- [ ] **Task 4.2**: Documentation
-  - User guide for query syntax
-  - Admin guide for deployment
-  - API documentation
-
-- [ ] **Task 4.3**: Integration testing
-  - Test with real experiment folders
-  - Verify ACL enforcement
-  - Performance under load
+- [ ] **Task 4.3**: Documentation
+  - User guide (how to connect and query)
+  - Admin guide (sync, monitoring, troubleshooting)
+  - Migration guide from centralized SQLite
 
 ---
 
 ## 8. Directory Structure
 
-### Prototype Directory Layout
+### This Worktree
 
 ```
-/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/elog-copilot-federated/
-├── HANDOFF.md                    # This document
-├── src/
-│   ├── federated_elog.py         # Query layer implementation
-│   ├── setup_schemas.py          # Schema creation script
-│   ├── migrate_data.py           # Data migration script (to create)
-│   └── __init__.py
-├── tests/
-│   ├── test_query_layer.py       # Unit tests
-│   ├── test_permissions.py       # Permission gating tests
-│   └── conftest.py               # Pytest fixtures
-├── data/                         # Dummy data for testing
-│   ├── master.db                 # Master index DB
-│   └── experiments/              # Mimics /sdf/data/lcls/ds/
-│       ├── cxi/
-│       │   ├── cxilz5418/
-│       │   │   └── .elog/
-│       │   │       └── elog.db
-│       │   └── cxi00123/
-│       │       └── .elog/
-│       │           └── elog.db
-│       └── mfx/
-│           └── mfx00456/
-│               └── .elog/
-│                   └── elog.db
+elog-copilot-postgres/                     # Git worktree on branch-postgres
+├── CLAUDE.md                              # Project instructions
+├── HANDOFF.md                             # This document
+├── docs/
+│   ├── postgres-rls-design.md             # Detailed RLS design
+│   └── duckdb-native-migration.md         # Historical (from branch-b)
+├── sql/
+│   ├── 01_schema.sql                      # PostgreSQL table definitions
+│   ├── 02_rls_policies.sql                # RLS policy definitions
+│   └── 03_test_data.sql                   # Sample data + migration notes
 ├── scripts/
-│   ├── create_dummy_data.sh      # Generate test data
-│   └── test_permissions.sh       # Test permission scenarios
-└── pyproject.toml                # Project configuration
+│   └── setup.sh                           # Setup instructions
+└── src/                                   # Historical (from branch-b)
+    ├── create_prototype_data.py           # DuckDB extractor (not used)
+    └── federated_elog.py                  # DuckDB query layer (not used)
 ```
 
-### Production Directory Layout (Target)
+### Related Worktree (DuckDB exploration)
 
 ```
-# Central (readable by all)
-/sdf/group/lcls/ds/dm/apps/dev/data/elog-copilot-federated/
-└── master.db                     # Master index only
-
-# Per-experiment (inherits folder ACLs)
-/sdf/data/lcls/ds/<hutch>/<experiment>/.elog/
-└── elog.db                       # Experiment-specific data
-
-# Examples:
-/sdf/data/lcls/ds/cxi/cxilz5418/.elog/elog.db
-/sdf/data/lcls/ds/mfx/mfx00123/.elog/elog.db
-/sdf/data/lcls/ds/xpp/xpp12345/.elog/elog.db
+../elog-copilot-federated-b/               # Git worktree on branch-b
+├── src/
+│   ├── elog_extractor.py                  # Single experiment → DuckDB
+│   ├── master_builder.py                  # Master index builder
+│   └── federated_elog.py                  # DuckDB query layer
+├── scripts/
+│   └── run_real_test.sh                   # Orchestration
+├── docs/                                  # Exploration documentation
+│   ├── 2026-02-04-candidate-experiments-research.md
+│   ├── 2026-02-04-unified-query-layer-discussion.md
+│   ├── 2026-02-04-cli-dynamic-view-solution.md
+│   ├── 2026-02-05-per-user-sqlite-analysis.md
+│   └── ...
+└── test_real_experiments.py               # DuckDB integration tests
 ```
 
 ---
 
 ## 9. Open Questions
 
-These are decisions for you to explore during the prototype:
+### Infrastructure
 
-### Architecture
+1. **PostgreSQL hosting**: Use an existing LCLS PostgreSQL instance or provision a new one?
 
-1. **Detector catalog sync**: Should detector_catalog be in master (shared) or replicated to each experiment DB? Consider query patterns.
+2. **Authentication**: How do users authenticate to the database?
+   - Unix socket with peer auth (requires local access)?
+   - Password auth (credential management)?
+   - Kerberos/GSSAPI (aligns with existing LCLS auth)?
 
-2. **Schema versioning**: How to handle schema migrations across 1,800+ experiment databases?
+3. **Backup and HA**: What's the recovery strategy?
 
-3. **Caching**: Should the query layer cache experiment paths? How to invalidate?
+### Permission Model
+
+4. **Permission sync mechanism**: How to populate `user_experiment_access`?
+   - Probe filesystem ACLs (`os.access()` for each user x experiment)?
+   - Query LDAP/AD group membership?
+   - Use existing permission API?
+
+5. **Sync frequency**: How often to sync permissions?
+   - Real-time (trigger-based)?
+   - Periodic (cron)?
+   - On-demand (user-initiated)?
+
+6. **Permission revocation**: When a user loses access, how quickly must it take effect?
 
 ### Data Management
 
-4. **Incremental updates**: How to detect which experiment DBs need updating? Timestamp comparison? Hash?
+7. **Write access**: Should users be able to write through PostgreSQL, or read-only (writes go through elogfetch)?
 
-5. **Initial migration**: Migrate all 1,841 experiments at once, or phase by instrument/time?
+8. **Data freshness**: How to keep PostgreSQL in sync with the authoritative elog source?
+   - One-time migration with PostgreSQL as new authoritative source?
+   - Continuous replication from upstream?
+   - Periodic batch sync?
 
-6. **Storage overhead**: Is 1,841 separate SQLite files acceptable? (Current: 1 file × 1.3GB vs. 1,841 files × ~700KB each ≈ 1.3GB total)
-
-### Query Layer
-
-7. **SQL parsing**: Use regex (simple) or proper parser like `sqlparse` (robust)?
-
-8. **Cross-experiment aggregations**: How to handle `SELECT COUNT(*) FROM all_runs`? Pre-compute in master?
-
-9. **Error reporting**: When a user can't access 5 of 10 requested experiments, how verbose should the error be?
-
-### Operations
-
-10. **Fallback**: If federated query fails, should it fall back to centralized DB?
-
-11. **Monitoring**: How to track query patterns, permission denials, performance?
-
-12. **Cleanup**: How to handle experiments that are archived/deleted?
+9. **Data locality**: Is it important that experiment data lives in the experiment directory (on-disk alongside the data)?
+   - If yes, PostgreSQL is a complement, not replacement
+   - If no, PostgreSQL can be the sole data store
 
 ---
 
@@ -1166,17 +654,22 @@ These are decisions for you to explore during the prototype:
 - **Centralized DB**: `/sdf/group/lcls/ds/dm/apps/dev/data/elog-copilot/elog-copilot.db`
 - **API docs**: `https://pswww.slac.stanford.edu/ws/lgbk/` (internal)
 
-### Technologies
+### PostgreSQL RLS
+
+- **RLS documentation**: https://www.postgresql.org/docs/current/ddl-rowsecurity.html
+- **RLS tutorial**: https://www.postgresql.org/docs/current/sql-createpolicy.html
+- **Multi-tenant RLS patterns**: https://www.postgresql.org/docs/current/ddl-rowsecurity.html#DDL-ROWSECURITY-1
+
+### DuckDB Exploration (historical)
 
 - **DuckDB docs**: https://duckdb.org/docs/
 - **DuckDB SQLite extension**: https://duckdb.org/docs/extensions/sqlite
-- **SQLite ATTACH**: https://www.sqlite.org/lang_attach.html
+- **Exploration docs**: See `branch-b` worktree at `../elog-copilot-federated-b/docs/`
 
 ### Industry Examples
 
 - **Turso (database-per-tenant)**: https://turso.tech/multi-tenancy
-- **ayb (multi-tenant SQLite)**: https://blog.marcua.net/2023/06/25/ayb-a-multi-tenant-database-that-helps-you-own-your-data.html
-- **HPC ACL management**: https://hpc.dccn.nl/docs/project_storage/access_management.html
+- **PostgreSQL RLS patterns**: https://supabase.com/docs/guides/database/postgres/row-level-security
 
 ### Contact
 
@@ -1184,4 +677,4 @@ Questions about this project: Cong Wang (cwang31@slac.stanford.edu)
 
 ---
 
-*Last updated: 2026-02-04*
+*Last updated: 2026-02-05*
